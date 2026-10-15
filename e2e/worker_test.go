@@ -11,10 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,8 +34,8 @@ type worker struct {
 	runtime wazero.Runtime
 	module  wazero.CompiledModule
 	volume  string
-	// What subako_http answers, and the requests it was sent.
-	answer string
+	// What subako_http answers each request with, and the requests it was sent.
+	answer func(sent map[string]any) string
 	sent   []map[string]any
 }
 
@@ -51,7 +54,9 @@ func newWorker(t *testing.T) *worker {
 		t.Fatal(sharedErr)
 	}
 	shared.volume = t.TempDir()
-	shared.answer = ""
+	shared.answer = func(map[string]any) string {
+		return `{"error":{"kind":"host_not_allowed","message":"this function has no network access"}}`
+	}
 	shared.sent = nil
 	return shared
 }
@@ -63,7 +68,7 @@ func start() (*worker, error) {
 	}
 	defer os.RemoveAll(dir)
 	wasm := filepath.Join(dir, "module.wasm")
-	build := exec.Command("go", "build", "-o", wasm, "./examples/weather")
+	build := exec.Command("go", "build", "-o", wasm, "./examples/github")
 	build.Dir = ".."
 	build.Env = append(os.Environ(), "GOOS=wasip1", "GOARCH=wasm")
 	if out, err := build.CombinedOutput(); err != nil {
@@ -85,7 +90,7 @@ func start() (*worker, error) {
 			return -1
 		}
 		w.sent = append(w.sent, sent)
-		pending = []byte(w.answer)
+		pending = []byte(w.answer(sent))
 		return int32(len(pending))
 	}).Export("request").
 		NewFunctionBuilder().WithFunc(func(ctx context.Context, m api.Module, ptr, size uint32) int32 {
@@ -182,6 +187,27 @@ func call(tool string, arguments map[string]any) map[string]any {
 	return map[string]any{"method": "tools/call", "params": map[string]any{"name": tool, "arguments": arguments}}
 }
 
+// github answers GitHub API requests with bodies by path, and saves a
+// requested file into the volume as the worker would.
+func (w *worker) github(bodies map[string]string) {
+	w.answer = func(sent map[string]any) string {
+		target, _ := url.Parse(sent["url"].(string))
+		if output, ok := sent["output"].(map[string]any); ok && output["type"] == "file" {
+			inside := strings.TrimPrefix(output["path"].(string), "/volume/")
+			file := filepath.Join(w.volume, filepath.FromSlash(inside))
+			os.MkdirAll(filepath.Dir(file), 0o755)
+			os.WriteFile(file, []byte("\x89PNG"), 0o644)
+			return fmt.Sprintf(`{"ok":{"status":200,"headers":{},"body":{"type":"file","path":%q,"bytes":4}}}`, output["path"])
+		}
+		body, ok := bodies[target.Path]
+		if !ok {
+			return `{"ok":{"status":404,"headers":{},"body":{"type":"inline","text":"{\"message\":\"Not Found\"}"}}}`
+		}
+		text, _ := json.Marshal(body)
+		return fmt.Sprintf(`{"ok":{"status":200,"headers":{"content-type":"application/json"},"body":{"type":"inline","text":%s}}}`, text)
+	}
+}
+
 func TestTheWorkerSurveysThePackage(t *testing.T) {
 	w := newWorker(t)
 	answers := w.session(t, map[string]any{"method": "server/discover"}, map[string]any{"method": "tools/list"})
@@ -193,48 +219,78 @@ func TestTheWorkerSurveysThePackage(t *testing.T) {
 	for _, tool := range result(t, answers[1])["tools"].([]any) {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if got, _ := json.Marshal(names); string(got) != `["fetch","forecast","plot"]` {
+	if got, _ := json.Marshal(names); string(got) != `["avatar","issues","repo"]` {
 		t.Errorf("tools = %s", got)
 	}
 }
 
-func TestACallAnswersWithStructuredContent(t *testing.T) {
+func TestARepositoryComesBackAsStructuredContent(t *testing.T) {
 	w := newWorker(t)
-	got := result(t, w.session(t, call("forecast", map[string]any{"city": "東京"}))[0])
-	if structured, _ := json.Marshal(got["structuredContent"]); string(structured) != `{"city":"東京","high_c":21.5}` {
-		t.Errorf("structuredContent = %s", structured)
+	w.github(map[string]string{"/repos/golang/go": `{"full_name":"golang/go","stargazers_count":130000,"forks_count":18000,"open_issues_count":9000,"default_branch":"master","html_url":"https://github.com/golang/go","description":"The Go programming language"}`})
+	got := result(t, w.session(t, call("repo", map[string]any{"owner": "golang", "repo": "go"}))[0])
+	structured := got["structuredContent"].(map[string]any)
+	if structured["full_name"] != "golang/go" || structured["stargazers_count"] != 130000.0 {
+		t.Errorf("structuredContent = %v", structured)
+	}
+	if len(w.sent) != 1 || w.sent[0]["method"] != "GET" || w.sent[0]["url"] != "https://api.github.com/repos/golang/go" {
+		t.Errorf("sent %v", w.sent)
+	}
+	if accept := w.sent[0]["headers"].(map[string]any)["accept"]; accept != "application/vnd.github+json" {
+		t.Errorf("accept = %v", accept)
 	}
 }
 
-func TestBadInputIsAToolError(t *testing.T) {
+func TestAMissingRepositoryIsAToolError(t *testing.T) {
 	w := newWorker(t)
-	got := result(t, w.session(t, call("forecast", map[string]any{}))[0])
+	w.github(nil)
+	got := result(t, w.session(t, call("repo", map[string]any{"owner": "nobody", "repo": "nothing"}))[0])
 	if got["isError"] != true {
 		t.Errorf("isError = %v", got["isError"])
 	}
 }
 
-func TestNetHTTPGoesThroughSubakoHTTP(t *testing.T) {
+func TestIssuesLeaveOutPullRequests(t *testing.T) {
 	w := newWorker(t)
-	w.answer = `{"ok":{"status":200,"headers":{},"body":{"type":"inline","text":"hello"}}}`
-	got := result(t, w.session(t, call("fetch", map[string]any{"url": "https://example.com/"}))[0])
-	if structured, _ := json.Marshal(got["structuredContent"]); string(structured) != `{"status":200,"text":"hello"}` {
-		t.Errorf("structuredContent = %s", structured)
+	w.github(map[string]string{"/repos/golang/go/issues": `[
+		{"number":2,"title":"a bug","user":{"login":"gopher"},"comments":3,"html_url":"https://github.com/golang/go/issues/2"},
+		{"number":1,"title":"a fix","user":{"login":"gopher"},"comments":0,"html_url":"https://github.com/golang/go/pull/1","pull_request":{}}
+	]`})
+	got := result(t, w.session(t, call("issues", map[string]any{"owner": "golang", "repo": "go", "label": "NeedsFix"}))[0])
+	want := map[string]any{"issues": []any{map[string]any{
+		"number": 2.0, "title": "a bug", "author": "gopher", "comments": 3.0, "url": "https://github.com/golang/go/issues/2",
+	}}}
+	if !reflect.DeepEqual(got["structuredContent"], want) {
+		t.Errorf("structuredContent = %v", got["structuredContent"])
 	}
-	if len(w.sent) != 1 || w.sent[0]["url"] != "https://example.com/" || w.sent[0]["method"] != "GET" {
+	if sent := w.sent[0]["url"]; sent != "https://api.github.com/repos/golang/go/issues?labels=NeedsFix&per_page=10&state=open" {
+		t.Errorf("url = %v", sent)
+	}
+}
+
+func TestBadInputIsAToolError(t *testing.T) {
+	w := newWorker(t)
+	got := result(t, w.session(t, call("repo", map[string]any{"owner": "golang"}))[0])
+	if got["isError"] != true {
+		t.Errorf("isError = %v", got["isError"])
+	}
+	if len(w.sent) != 0 {
 		t.Errorf("sent %v", w.sent)
 	}
 }
 
-func TestAnImageInTheVolumeIsLinked(t *testing.T) {
+func TestAnAvatarIsSavedToTheVolumeAndShown(t *testing.T) {
 	w := newWorker(t)
-	got := result(t, w.session(t, call("plot", map[string]any{}))[0])
+	w.github(nil)
+	got := result(t, w.session(t, call("avatar", map[string]any{"owner": "golang"}))[0])
 	content := got["content"].([]any)
 	link := content[len(content)-1].(map[string]any)
-	if link["type"] != "resource_link" || link["uri"] != "volume:///tmp/chart.png" {
+	if link["type"] != "resource_link" || link["uri"] != "volume:///tmp/avatar-golang.png" {
 		t.Errorf("last block = %v", link)
 	}
-	if _, err := os.Stat(filepath.Join(w.volume, "tmp", "chart.png")); err != nil {
+	if sent := w.sent[0]["url"]; sent != "https://github.com/golang.png?size=200" {
+		t.Errorf("url = %v", sent)
+	}
+	if _, err := os.Stat(filepath.Join(w.volume, "tmp", "avatar-golang.png")); err != nil {
 		t.Error(err)
 	}
 }

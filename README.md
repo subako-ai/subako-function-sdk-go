@@ -4,8 +4,8 @@ Write Subako function packages in Go with the [official MCP Go SDK](https://gith
 
 ```go
 func main() {
-	server := mcp.NewServer(&mcp.Implementation{Name: "weather", Version: "0.1.0"}, nil)
-	mcp.AddTool(server, &mcp.Tool{Name: "forecast", Description: "Tomorrow's forecast for a city."}, forecast)
+	server := mcp.NewServer(&mcp.Implementation{Name: "github", Version: "0.1.0"}, nil)
+	mcp.AddTool(server, &mcp.Tool{Name: "repo", Description: "A GitHub repository's stars, forks and open issues."}, repo)
 	subakofn.Serve(server)
 }
 ```
@@ -22,7 +22,7 @@ cp subako-package.json dist/
 subako function create dist   # or: subako function push <function-id> dist
 ```
 
-See [examples/weather](examples/weather). Requires Go 1.25.
+See [examples/github](examples/github). Requires Go 1.25.
 
 ## License
 
